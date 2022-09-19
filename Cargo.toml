@@ -1,0 +1,22 @@
+[package]
+name = "modality-otel-receiver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+modality-api = { git = "https://github.com/auxoncorp/modality-sdk", branch="dynamic-ingest" }
+modality-ingest-client= { git = "https://github.com/auxoncorp/modality-sdk", branch="dynamic-ingest" }
+modality-ingest-protocol = { git = "https://github.com/auxoncorp/modality-sdk", branch="dynamic-ingest" }
+modality-reflector-config = "0.1"
+tonic = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+prost = "0.11.0"
+uuid = { version = "1.1.2" , default-features = false, features = ["v4", "v5"] }
+
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "2.3.1"
+async-recursion = "1.0.0"
+
+[build-dependencies]
+tonic-build = "0.8"
