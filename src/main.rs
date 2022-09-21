@@ -1,5 +1,6 @@
-#![allow(unused)]
-
+mod auth;
+mod config;
+mod opts;
 mod otlp;
 
 use std::{
@@ -7,24 +8,22 @@ use std::{
         hash_map::{DefaultHasher, Entry},
         BTreeMap, HashMap,
     },
-    fmt::Write,
     hash::Hasher,
-    num::ParseIntError,
 };
 
-use async_recursion::async_recursion;
+use clap::Parser;
+use config::OtelReceiverConfig;
 use modality_api::{AttrVal, TimelineId};
 use modality_ingest_client::{
-    dynamic::DynamicIngestClient, BoundTimelineState, IngestClient, IngestClientCommon, ReadyState,
-    UnauthenticatedState,
+    dynamic::DynamicIngestClient, IngestClient, ReadyState, UnauthenticatedState,
 };
 use modality_ingest_protocol::InternedAttrKey;
+use opts::Opts;
 use otlp::opentelemetry::proto::{
-    common::v1::{any_value, AnyValue, KeyValue, KeyValueList},
+    common::v1::{any_value, AnyValue, KeyValue},
     trace::v1::ResourceSpans,
 };
 use tokio::sync::mpsc::Receiver;
-use tonic::transport::Server;
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -38,27 +37,30 @@ async fn main() {
 }
 
 async fn do_main() -> Result<(), DynError> {
+    let opts = Opts::parse();
+
     tracing_subscriber::fmt::init();
-    let addr = "0.0.0.0:4317".parse()?;
 
-    let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(1024);
+    let cfg = OtelReceiverConfig::load_merge_with_opts(opts)?;
 
+    let (message_tx, message_rx) = tokio::sync::mpsc::channel(1024);
+
+    let addr = cfg.otlp_addr();
     let otlp_server = tokio::spawn(async move {
         info!("OTLP/gRPC listening at http://{addr}");
         otlp::run_receiver(addr, message_tx).await
     });
 
     let client = IngestClient::<UnauthenticatedState>::connect(
-        &"modality-ingest://localhost".parse()?,
-        true,
+        &cfg.protocol_parent_url()?,
+        cfg.ingest.allow_insecure_tls,
     )
     .await?;
 
-    let client = client
-        .authenticate(decode_hex("29696b2f488d4f608358ff10c1078e3a")?)
-        .await?;
-
-    let ingest = tokio::spawn(async move { ResourceSender::send_loop(client, message_rx).await });
+    let client = client.authenticate(cfg.resolve_auth()?.to_vec()).await?;
+    let ingest = tokio::spawn(async move {
+        ResourceSender::send_loop(client, &cfg.plugin.run_id, message_rx).await
+    });
 
     ingest.await??;
     otlp_server.await??;
@@ -67,7 +69,7 @@ async fn do_main() -> Result<(), DynError> {
 }
 
 struct ResourceSender {
-    instance_id: Uuid,
+    run_id: Uuid,
     client: DynamicIngestClient,
     keys: Keys,
 }
@@ -77,10 +79,13 @@ mod keys {
         pub const RUN_ID: &str = "timeline.run_id";
         pub const NAME: &str = "timeline.name";
 
+        pub mod trace {
+            pub const ID: &str = "timeline.trace.id";
+        }
+
         pub mod service {
-            pub const NAMESPACE: &str = "timeline.service.namepace";
+            pub const NAMESPACE: &str = "timeline.service.namespace";
             pub const NAME: &str = "timeline.service.name";
-            pub const INSTANCE_ID: &str = "timeline.service.instance.id";
         }
 
         pub mod span {
@@ -94,6 +99,10 @@ mod keys {
         pub const TIMESTAMP: &str = "event.timestamp";
         pub const NONCE: &str = "event.nonce";
 
+        pub mod trace {
+            pub const ID: &str = "event.trace.id";
+        }
+
         pub mod span {
             pub const ID: &str = "event.span.id";
             pub const NAME: &str = "event.span.name";
@@ -102,7 +111,6 @@ mod keys {
 
         pub mod interaction {
             pub const REMOTE_TIMELINE_ID: &str = "event.interaction.remote_timeline_id";
-            pub const REMOTE_TIMESTAMP: &str = "event.interaction.remote_timestamp";
             pub const REMOTE_NONCE: &str = "event.interaction.remote_nonce";
         }
     }
@@ -113,10 +121,10 @@ struct Keys {
 }
 
 impl Keys {
-    async fn new(client: &mut DynamicIngestClient) -> Result<Self, DynError> {
-        let mut map = HashMap::<String, InternedAttrKey>::new();
-
-        Ok(Self { interned_keys: map })
+    async fn new() -> Result<Self, DynError> {
+        Ok(Self {
+            interned_keys: HashMap::<String, InternedAttrKey>::new(),
+        })
     }
 
     async fn intern_key<'a>(
@@ -133,10 +141,10 @@ impl Keys {
         client: &mut DynamicIngestClient,
     ) -> Result<InternedAttrKey, DynError> {
         match map.entry(key.clone()) {
-            Entry::Occupied(occupado) => Ok(occupado.get().clone()),
+            Entry::Occupied(occupado) => Ok(*occupado.get()),
             Entry::Vacant(desoccupado) => {
                 let interned = client.declare_attr_key(key).await?;
-                Ok(desoccupado.insert(interned).clone())
+                Ok(*desoccupado.insert(interned))
             }
         }
     }
@@ -145,22 +153,27 @@ impl Keys {
 impl ResourceSender {
     async fn send_loop(
         client: IngestClient<ReadyState>,
+        run_id: &Option<Uuid>,
         mut message_rx: Receiver<Vec<ResourceSpans>>,
     ) -> Result<(), DynError> {
-        let mut client = DynamicIngestClient::from(client);
-        let keys = Keys::new(&mut client).await?;
-        let mut sender = ResourceSender::new(client, keys);
+        let client = DynamicIngestClient::from(client);
+        let keys = Keys::new().await?;
+        let mut sender = ResourceSender::new(client, keys, run_id);
+
         while let Some(message) = message_rx.recv().await {
-            let tls = resource_spans_to_timelines(sender.instance_id, message);
+            let tls = resource_spans_to_timelines(&sender.run_id, message);
             sender.send_timelines(tls).await?;
         }
 
         Ok(())
     }
 
-    fn new(client: DynamicIngestClient, keys: Keys) -> Self {
+    fn new(client: DynamicIngestClient, keys: Keys, run_id: &Option<Uuid>) -> Self {
         Self {
-            instance_id: Uuid::new_v4(),
+            run_id: match run_id {
+                Some(uuid) => *uuid,
+                None => Uuid::new_v4(),
+            },
             client,
             keys,
         }
@@ -168,19 +181,6 @@ impl ResourceSender {
 
     async fn interned_key<'a>(&mut self, key: String) -> Result<InternedAttrKey, DynError> {
         self.keys.intern_key(key, &mut self.client).await
-    }
-
-    async fn prefixed_interned_key<'a>(
-        &mut self,
-        mut prefix: Vec<String>,
-        key: String,
-    ) -> Result<InternedAttrKey, DynError> {
-        if !prefix.is_empty() {
-            prefix.push(key);
-            self.interned_key(prefix.join(".")).await
-        } else {
-            self.interned_key(key).await
-        }
     }
 
     async fn prepare_attr_map(
@@ -214,25 +214,10 @@ impl ResourceSender {
     }
 }
 
-fn decode_hex(s: &str) -> Result<Vec<u8>, ParseIntError> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect()
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::new();
-    for b in bytes {
-        let _ = write!(&mut s, "{:x}", b);
-    }
-    s
-}
-
 struct SendableTimeline {
     id: TimelineId,
     attrs: AttrMap,
-    // coarse ordering (nx timestamp) -> attrmaps
+    // coarse ordering (timestamp) -> attrmaps at that timestamp
     events: BTreeMap<u64, Vec<AttrMap>>,
 }
 
@@ -264,13 +249,13 @@ impl AttrMap {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<&AttrVal> {
+    fn get(&self, key: &str) -> Option<&AttrVal> {
         self.0.get(key)
     }
 }
 
 fn resource_spans_to_timelines(
-    instance_id: Uuid,
+    instance_id: &Uuid,
     resource_spans_list: Vec<ResourceSpans>,
 ) -> Vec<SendableTimeline> {
     let mut timelines = vec![];
@@ -301,54 +286,30 @@ fn resource_spans_to_timelines(
             }
 
             for span in scope_span.spans.into_iter() {
-                let mut ordering = 0;
                 let timeline_id = semantic_timeline_id(&span.trace_id, &span.span_id);
+                let mut tl = SendableTimeline::new(timeline_id);
 
-                let mut timeline = SendableTimeline::new(timeline_id);
-
-                timeline.attrs.extend(&resource_attrs);
-                timeline.attrs.extend(&scope_attrs);
-                timeline
-                    .attrs
+                // timeline attrs
+                tl.attrs.extend(&resource_attrs);
+                tl.attrs.extend(&scope_attrs);
+                tl.attrs
                     .insert(keys::timeline::RUN_ID, instance_id.to_string());
-                timeline
-                    .attrs
-                    .insert(keys::timeline::span::ID, encode_hex(&span.span_id));
-                timeline
-                    .attrs
+                tl.attrs
+                    .insert(keys::timeline::trace::ID, hex::encode(&span.trace_id));
+                tl.attrs
+                    .insert(keys::timeline::span::ID, hex::encode(&span.span_id));
+                tl.attrs
                     .insert(keys::timeline::span::NAME, span.name.clone());
-
-                // TODO factor out timeline name computation
-                let mut timeline_name_components = vec![];
-                dbg!(&resource_attrs);
-
-                if let Some(ns) = resource_attrs.get(keys::timeline::service::NAMESPACE) {
-                    timeline_name_components.push(ns.to_string());
-                }
-                if let Some(name) = resource_attrs.get(keys::timeline::service::NAME) {
-                    timeline_name_components.push(name.to_string());
-                }
-                if let Some(sn) = timeline.attrs.get(keys::timeline::span::NAME) {
-                    timeline_name_components.push(sn.to_string());
-                }
-                if timeline_name_components.is_empty() {
-                    timeline_name_components.push(timeline_id.to_string());
-                }
-                let timeline_name = timeline_name_components.join(".");
-
-                timeline.attrs.insert(keys::timeline::NAME, timeline_name);
-
-                let parent_timeline_id = if !span.parent_span_id.is_empty() {
-                    Some(semantic_timeline_id(&span.trace_id, &span.parent_span_id))
-                } else {
-                    None
-                };
+                tl.attrs.insert(
+                    keys::timeline::NAME,
+                    compute_timeline_name(&resource_attrs, &span.name, timeline_id),
+                );
 
                 // emit a start event
-
-                // TODO trace_id; make sure all fields are reprsented.
                 let mut start_event = AttrMap::default();
-                start_event.insert(keys::event::span::ID, encode_hex(&span.span_id));
+                start_event.insert(keys::event::trace::ID, hex::encode(&span.trace_id));
+                start_event.insert(keys::event::span::ID, hex::encode(&span.span_id));
+                start_event.insert(keys::event::span::NAME, AttrVal::from(span.name.clone()));
 
                 let start_timestamp = AttrVal::Timestamp(span.start_time_unix_nano.into());
                 start_event.insert(keys::event::TIMESTAMP, start_timestamp.clone());
@@ -357,10 +318,15 @@ fn resource_spans_to_timelines(
                 if !span.parent_span_id.is_empty() {
                     start_event.insert(
                         keys::event::span::PARENT_SPAN_ID,
-                        encode_hex(&span.parent_span_id),
+                        hex::encode(&span.parent_span_id),
                     );
                 }
 
+                let parent_timeline_id = if !span.parent_span_id.is_empty() {
+                    Some(semantic_timeline_id(&span.trace_id, &span.parent_span_id))
+                } else {
+                    None
+                };
                 if let Some(parent_timeline_id) = parent_timeline_id {
                     start_event.insert(
                         keys::event::interaction::REMOTE_TIMELINE_ID,
@@ -386,7 +352,7 @@ fn resource_spans_to_timelines(
                 );
 
                 otlp_kvs_to_modality(vec!["event".to_string()], span.attributes, &mut start_event);
-                timeline.insert_event(span.start_time_unix_nano, start_event);
+                tl.insert_event(span.start_time_unix_nano, start_event);
 
                 for event in span.events.into_iter() {
                     // emit individual events
@@ -404,7 +370,7 @@ fn resource_spans_to_timelines(
                         &mut event_attrs,
                     );
 
-                    timeline.insert_event(event.time_unix_nano, event_attrs);
+                    tl.insert_event(event.time_unix_nano, event_attrs);
                 }
 
                 let mut end_event = AttrMap::default();
@@ -412,12 +378,8 @@ fn resource_spans_to_timelines(
                     keys::event::NAME,
                     AttrVal::from(format!("end_{}", span.name)),
                 );
-                let end_timestamp = 
-                    AttrVal::Timestamp(span.end_time_unix_nano.into());
-                end_event.insert(
-                    keys::event::TIMESTAMP,
-                    end_timestamp.clone()
-                );
+                let end_timestamp = AttrVal::Timestamp(span.end_time_unix_nano.into());
+                end_event.insert(keys::event::TIMESTAMP, end_timestamp.clone());
 
                 if let Some(parent_timeline_id) = parent_timeline_id {
                     let join_nonce =
@@ -436,20 +398,17 @@ fn resource_spans_to_timelines(
                         .entry(parent_timeline_id)
                         .or_default()
                         .push((span.end_time_unix_nano, parent_join_event));
-                } else {
-                    // TODO remote_timestamp here? or will we fix up nonces elsewhere?
-                }
+                } 
 
-                timeline.insert_event(span.end_time_unix_nano, end_event);
-                timelines.push(timeline);
+                tl.insert_event(span.end_time_unix_nano, end_event);
+                timelines.push(tl);
             }
         }
     }
 
     // splice 'timeline_events_to_add' into the timelines themselves
-    dbg!(timelines.iter().map(|tl| tl.id).collect::<Vec<_>>());
     for (tl_id, events) in timeline_events_to_add.into_iter() {
-        if let Some(mut tl) = timelines.iter_mut().find(|tl| tl.id == tl_id) {
+        if let Some(tl) = timelines.iter_mut().find(|tl| tl.id == tl_id) {
             for (ordering, attrs) in events.into_iter() {
                 tl.insert_event(ordering, attrs);
             }
@@ -465,13 +424,35 @@ fn resource_spans_to_timelines(
     timelines
 }
 
+fn compute_timeline_name(
+    resource_attrs: &AttrMap,
+    span_name: &str,
+    timeline_id: TimelineId,
+) -> String {
+    let mut timeline_name_components = vec![];
+    // The first two should be filled out by the otlp_kvs_to_modality call for the resource
+    if let Some(ns) = resource_attrs.get(keys::timeline::service::NAMESPACE) {
+        timeline_name_components.push(ns.to_string());
+    }
+    if let Some(name) = resource_attrs.get(keys::timeline::service::NAME) {
+        timeline_name_components.push(name.to_string());
+    }
+
+    timeline_name_components.push(span_name.to_string());
+
+    if timeline_name_components.is_empty() {
+        timeline_name_components.push(timeline_id.to_string());
+    }
+    timeline_name_components.join(".")
+}
+
 const NAMESPACE_OTEL: Uuid = Uuid::from_bytes([
     0x34, 0xdc, 0x16, 0x00, 0xcb, 0x32, 0xed, 0x11, 0xfc, 0xb2, 0xf7, 0x4b, 0x86, 0xf8, 0x7e, 0xfe,
 ]);
 
 fn semantic_timeline_id(trace_id: &[u8], span_id: &[u8]) -> TimelineId {
     let mut bytes = trace_id.to_vec();
-    bytes.extend_from_slice(&span_id);
+    bytes.extend_from_slice(span_id);
     TimelineId::from(Uuid::new_v5(&NAMESPACE_OTEL, &bytes))
 }
 
@@ -528,14 +509,14 @@ fn otlp_kv_to_modality(prefix: Vec<String>, key: String, otlp_val: AnyValue, att
                 attrs.insert(prefixed_key(prefix, key), d);
             }
             any_value::Value::ArrayValue(a) => {
-                let mut p = prefix.clone();
+                let mut p = prefix;
                 p.push(key);
                 for (i, val) in a.values.into_iter().enumerate() {
                     otlp_kv_to_modality(p.clone(), i.to_string(), val, attrs);
                 }
             }
             any_value::Value::KvlistValue(kvlist) => {
-                let mut p = prefix.clone();
+                let mut p = prefix;
                 p.push(key);
                 for kv in kvlist.values.into_iter() {
                     if let Some(val) = kv.value {
@@ -544,45 +525,8 @@ fn otlp_kv_to_modality(prefix: Vec<String>, key: String, otlp_val: AnyValue, att
                 }
             }
             any_value::Value::BytesValue(bytes) => {
-                attrs.insert(prefixed_key(prefix, key), encode_hex(&bytes));
+                attrs.insert(prefixed_key(prefix, key), hex::encode(&bytes));
             }
-        }
-    }
-}
-
-/// Turn timestamp-based span start and end interactions into
-/// nonce-based interactions, synthesizing events in the parent for
-/// them to point to.
-fn synthesize_nonces_for_local_interactions(timelines: &mut Vec<SendableTimeline>) {
-    for tl in timelines.iter_mut() {
-        for (_, ev) in tl.events.iter_mut() {
-            // if ev.get(keys::)
-        }
-    }
-}
-
-#[allow(unused)]
-pub struct Config {
-    timeline_allocation_mode: TimelineAllocationMode,
-    timeline_name_resource_keys: Vec<String>,
-    timeline_name_separator: String,
-    port: u16,
-}
-
-#[allow(unused)]
-enum TimelineAllocationMode {
-    TimelinePerSpan,
-    // FullyFlattened,
-    // PartiallyFlattened,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            timeline_allocation_mode: TimelineAllocationMode::TimelinePerSpan,
-            timeline_name_resource_keys: Default::default(),
-            timeline_name_separator: Default::default(),
-            port: 4317,
         }
     }
 }
